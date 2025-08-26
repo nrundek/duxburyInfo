@@ -1,0 +1,636 @@
+# -*- coding: UTF-8 -*-
+import re
+import time
+import appModuleHandler
+import ui
+import api
+from logHandler import log
+from controlTypes import Role
+import textInfos  # For caret/line text access
+
+class AppModule(appModuleHandler.AppModule):
+    """
+    Duxbury (dbtw.exe) AppModule
+
+    Shortcuts:
+      • Alt+9        -> Read full status bar (NVDA built-in first, then fallback).
+      • Alt+.        -> Speak only the line number ("Line 12").
+      • Alt+,        -> Speak only the page number ("Page 5").
+      • Alt+-        -> Speak "Column X of Y" (column in line and total columns in that line).
+      • Alt+Shift+.  -> Debug: list candidate UI texts and say best-found status.
+      • Alt+Shift+,  -> Debug: force UI-scan summary (Page/Line/Col).
+
+    All UI strings and comments are in English.
+    """
+
+    __gestures = {
+        # Full status line
+        "kb:alt+9": "reportDuxburyStatus",
+        "kb(laptop):alt+9": "reportDuxburyStatus",
+
+        # Line only
+        "kb:alt+.": "reportDuxburyColumn",
+        "kb(laptop):alt+.": "reportDuxburyColumn",
+
+        # Page only
+        "kb:alt+,": "reportPgLn",
+        "kb(laptop):alt+,": "reportPgLn",
+
+        # Column only (now: "Column X of Y")
+        "kb:alt+-": "reportDuxburyColumn",
+        "kb(laptop):alt+-": "reportDuxburyColumn",
+
+        
+
+        # Leading spaces (indent) only
+        "kb:alt+7": "reportLeadingSpaces",
+        "kb(laptop):alt+7": "reportLeadingSpaces",
+
+
+        # Toggle auto "read page on page turn"
+        "kb:alt+8": "toggleReadPageAnnouncements",
+        "kb(laptop):alt+8": "toggleReadPageAnnouncements",
+
+        # Force page announcement on next caret move (let key pass to DBT)
+        "kb:control+home": "forceAnnouncePageOnNextCaret",
+        "kb(laptop):control+home": "forceAnnouncePageOnNextCaret",
+        "kb:control+end": "forceAnnouncePageOnNextCaret",
+        "kb(laptop):control+end": "forceAnnouncePageOnNextCaret",
+        "kb:pageup": "forceAnnouncePageOnNextCaret",
+        "kb(laptop):pageup": "forceAnnouncePageOnNextCaret",
+        "kb:pagedown": "forceAnnouncePageOnNextCaret",
+        "kb(laptop):pagedown": "forceAnnouncePageOnNextCaret",
+
+# Debug
+        "kb:alt+shift+.": "debugListCandidates",
+        "kb(laptop):alt+shift+.": "debugListCandidates",
+        "kb:alt+shift+,": "debugScanSummary",
+        "kb(laptop):alt+shift+,": "debugScanSummary",
+    }
+
+    # ---------------------------
+    # Core retrieval
+    # ---------------------------
+    def _get_status_text_api(self):
+        """Try NVDA API (same source as Insert+End)."""
+        for _ in range(3):
+            try:
+                t = api.getStatusBarText()
+                if t and t.strip():
+                    return re.sub(r"\s+", " ", t).strip()
+            except Exception as e:
+                log.debug(f"dbtw: api.getStatusBarText failed: {e!r}")
+            time.sleep(0.03)
+        return None
+
+    def _iter_children(self, node, max_depth=6, max_nodes=800):
+        """Depth-first scan of UI tree with safety limits."""
+        count = 0
+        def _walk(n, depth):
+            nonlocal count
+            if not n or depth > max_depth or count >= max_nodes:
+                return
+            try:
+                kids = list(getattr(n, "children", []) or [])
+            except Exception:
+                kids = []
+            for k in kids:
+                count += 1
+                yield k
+                yield from _walk(k, depth+1)
+        yield from _walk(node, 0)
+
+    def _collect_candidate_texts(self):
+        """
+        Collect individual strings from UI nodes that might represent status parts.
+        Returns list of (priority, text) — lower priority number means stronger candidate.
+        """
+        candidates = []
+
+        # 1) Foreground object
+        try:
+            fg = api.getForegroundObject()
+        except Exception as e:
+            log.debug(f"dbtw: getForegroundObject failed: {e!r}")
+            fg = None
+
+        def _add(txt, prio):
+            if not txt:
+                return
+            s = re.sub(r"\s+", " ", txt).strip()
+            if not s:
+                return
+            candidates.append((prio, s))
+
+        if not fg:
+            return candidates
+
+        # 2) Walk subtree
+        for n in self._iter_children(fg, max_depth=6, max_nodes=800):
+            try:
+                role = getattr(n, "role", None)
+                # Prefer actual STATUSBAR nodes
+                if role == Role.STATUSBAR:
+                    for attr in ("name", "value", "windowText", "description"):
+                        _add(getattr(n, attr, None), 0)
+                else:
+                    # Other text-like nodes (panes, static texts) can hold status chunks
+                    basePrio = 2
+                    # If the window class looks like a status bar, give it higher priority
+                    wc = getattr(n, "windowClassName", "") or ""
+                    if isinstance(wc, str) and wc.lower() in ("msctls_statusbar32", "statusbarwindow32", "tstatusbar"):
+                        basePrio = 1
+
+                    for attr in ("name", "value", "windowText", "description"):
+                        _add(getattr(n, attr, None), basePrio)
+            except Exception:
+                continue
+
+        # Sort by priority, keep unique order
+        seen = set()
+        unique = []
+        for pr, s in sorted(candidates, key=lambda x: x[0]):
+            if s not in seen:
+                unique.append((pr, s))
+                seen.add(s)
+        return unique
+
+    # ---------------------------
+    # Parsing
+    # ---------------------------
+    _PAGE_PATTERNS = [
+        r"\b(Page|Pg|P|Stranica|Str)\b\s*[:#.=]?\s*(\d+)\b",
+        r"\b(Page)\s+(\d+)\s+of\b",
+        r"\bP\s*=\s*(\d+)\b", r"\bP(\d+)\b",
+        r"\bStr\s*=\s*(\d+)\b", r"\bStr(\d+)\b",
+    ]
+    _LINE_PATTERNS = [
+        r"\b(Line|Ln|Row|Linija|Redak|Retka)\b\s*[:#.=]?\s*(\d+)\b",
+        r"\b(Line)\s+(\d+)\s+of\b",
+        r"\b(L|R)\b\s*[:#.=]?\s*(\d+)\b",   # L:12 / R:12 (Croatian "Redak")
+        r"\bL\s*=\s*(\d+)\b", r"\bL(\d+)\b", r"\bLn\.?\s*[:#.=]?\s*(\d+)\b",
+        r"\b(Red(?:ak)?)\b\s*[:#.=]?\s*(\d+)\b",
+    ]
+    _COL_PATTERNS = [
+        r"\b(Column|Col|Cell|Kolona|Stupac|Kol|Stu)\b\s*[:#.=]?\s*(\d+)\b",
+        r"\b(C)\s*[:#.=]?\s*(\d+)\b", r"\bC\s*=\s*(\d+)\b", r"\bC(\d+)\b",
+    ]
+    # Patterns that carry both current and total columns, e.g., "Col 3/40" or "Column 3 of 40"
+    _COL_WITH_TOTAL_PATTERNS = [
+        r"\b(?:Column|Col|C)\b\s*[:#.=]?\s*(\d+)\s*/\s*(\d+)\b",
+        r"\b(?:Column|Col|C)\b\s*[:#.=]?\s*(\d+)\s+(?:of)\s+(\d+)\b",
+    ]
+
+    def _match_first_number(self, text, patterns):
+        for pat in patterns:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                for g in reversed(m.groups()):
+                    if g and str(g).isdigit():
+                        return g
+        return None
+
+    def _match_col_and_total(self, text):
+        """Try to extract (col, total) from a single string if it encodes both."""
+        for pat in self._COL_WITH_TOTAL_PATTERNS:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m and len(m.groups()) >= 2:
+                g1, g2 = m.group(1), m.group(2)
+                if g1 and g2 and g1.isdigit() and g2.isdigit():
+                    return g1, g2
+        return None, None
+
+    def _parse_from_any(self, texts):
+        """
+        Try to parse Page/Line/Col from a sequence of UI texts.
+        We first try each text individually (stronger signal), then try the concatenated string.
+        """
+        out = {}
+        # 1) Individual texts
+        for _, t in texts:
+            if "page" not in out:
+                n = self._match_first_number(t, self._PAGE_PATTERNS)
+                if n: out["page"] = n
+            if "line" not in out:
+                n = self._match_first_number(t, self._LINE_PATTERNS)
+                if n: out["line"] = n
+            if "col" not in out:
+                n = self._match_first_number(t, self._COL_PATTERNS)
+                if n: out["col"] = n
+            if "page" in out and "line" in out and "col" in out:
+                break
+
+        if "page" in out and "line" in out and "col" in out:
+            return out
+
+        # 2) Concatenated fallback (helps when pieces are in one label)
+        big = " | ".join(t for _, t in texts)
+        if "page" not in out:
+            n = self._match_first_number(big, self._PAGE_PATTERNS)
+            if n: out["page"] = n
+        if "line" not in out:
+            n = self._match_first_number(big, self._LINE_PATTERNS)
+            if n: out["line"] = n
+        if "col" not in out:
+            n = self._match_first_number(big, self._COL_PATTERNS)
+            if n: out["col"] = n
+
+        # 3) Positional heuristic (Page, Line, Col) if still missing
+        nums = re.findall(r"\d+", big)
+        if len(nums) >= 3:
+            out.setdefault("page", nums[0])
+            out.setdefault("line", nums[1])
+            out.setdefault("col",  nums[2])
+
+        return out
+
+    # ---------------------------
+    # Text info helpers (line length / caret col)
+    # ---------------------------
+    def _get_line_metrics(self):
+        """
+        Returns a tuple (caretCol1Based, totalCols) using NVDA's textInfos on the focused object.
+        If caret position can't be determined, returns (None, totalCols) or (None, None).
+        """
+        try:
+            obj = api.getFocusObject()
+            caret = obj.makeTextInfo(textInfos.POSITION_CARET)
+            # Expand to the current line
+            line = caret.copy()
+            line.expand(textInfos.UNIT_LINE)
+            lineText = line.text or ""
+            # Remove explicit newlines but keep spaces — we want visible columns
+            lineText = lineText.replace("\r", "").replace("\n", "")
+            totalCols = len(lineText)
+
+            # Compute caret column as characters from line start to caret, 1-based
+            startToCaret = line.copy()
+            # span from line start to caret
+            startToCaret.setEndPoint(caret, "endToEnd")
+            caretColsFromStart = startToCaret.text or ""
+            caretCol = len(caretColsFromStart) + 1  # 1-based
+
+            # Clamp caretCol between 1 and totalCols if total known
+            if totalCols > 0:
+                if caretCol < 1: caretCol = 1
+                if caretCol > totalCols: caretCol = totalCols
+            return caretCol, totalCols
+        except Exception as e:
+            log.debug(f"dbtw: _get_line_metrics failed: {e!r}")
+            return None, None
+
+    # ---------------------------
+    # Scripts
+    # ---------------------------
+    def script_reportDuxburyStatus(self, gesture):
+        """Speak the entire status bar, like Insert+End."""
+        # Try NVDA's built-in
+        try:
+            import globalCommands
+            globalCommands.commands.script_reportStatusLine(None)
+            return
+        except Exception as e:
+            log.debug(f"dbtw alt+9: built-in reportStatusLine failed: {e!r}")
+
+        # Fallback to API text
+        text = self._get_status_text_api()
+        if text:
+            ui.message(text)
+            return
+
+        # As a last resort, compose from UI scan
+        cand = self._collect_candidate_texts()
+        parsed = self._parse_from_any(cand)
+        if parsed:
+            parts = []
+            if "page" in parsed: parts.append(f"Page {parsed['page']}")
+            if "line" in parsed: parts.append(f"Line {parsed['line']}")
+            if "col"  in parsed: parts.append(f"Column {parsed['col']}")
+            if parts:
+                ui.message(", ".join(parts))
+                return
+
+        ui.message("Status bar not available.")
+
+    script_reportDuxburyStatus.__doc__ = "Read status bar (Alt+9)."
+
+    def script_reportDuxburyLine(self, gesture):
+        """Speak only the current line number ("Line 12")."""
+        # 1) Try API
+        text = self._get_status_text_api()
+        if text:
+            n = self._match_first_number(text, self._LINE_PATTERNS)
+            if not n:
+                # fallback positional when API returns combined text
+                nums = re.findall(r"\d+", text)
+                if len(nums) == 3: n = nums[1]
+            if n:
+                ui.message(f"Line {n}")
+                return
+
+        # 2) UI-scan
+        cand = self._collect_candidate_texts()
+        parsed = self._parse_from_any(cand)
+        if "line" in parsed:
+            ui.message(f"Line {parsed['line']}")
+            return
+
+        ui.message("Line number not available.")
+
+    script_reportDuxburyLine.__doc__ = "Speak only the line number (Alt+.)."
+
+
+    def script_reportDuxburyPage(self, gesture):
+        """Speak only the current page number ("Page 5")."""
+        # 1) Try API
+        text = self._get_status_text_api()
+        if text:
+            n = self._match_first_number(text, self._PAGE_PATTERNS)
+            if not n:
+                nums = re.findall(r"\d+", text)
+                if len(nums) >= 1: n = nums[0]
+            if n:
+                ui.message(f"Page {n}")
+                return
+
+        # 2) UI-scan
+        cand = self._collect_candidate_texts()
+        parsed = self._parse_from_any(cand)
+        if "page" in parsed:
+            ui.message(f"Page {parsed['page']}")
+            return
+
+        ui.message("Page number not available.")
+
+    script_reportDuxburyPage.__doc__ = "Speak only the page number (Alt+,)."
+
+    def script_reportPgLn(self, gesture):
+        """Speak short page+line summary: 'pg X, ln Y' (Alt+,)."""
+        # Try API first
+        text = self._get_status_text_api()
+        page = line = None
+        if text:
+            page = self._match_first_number(text, self._PAGE_PATTERNS)
+            if not page:
+                nums = re.findall(r"\d+", text)
+                if nums:
+                    page = nums[0]
+            line = self._match_first_number(text, self._LINE_PATTERNS)
+            if not line:
+                nums = re.findall(r"\d+", text)
+                if len(nums) >= 2:
+                    line = nums[1]
+
+        if not page or not line:
+            # UI-scan fallback
+            cand = self._collect_candidate_texts()
+            parsed = self._parse_from_any(cand)
+            page = page or parsed.get("page")
+            line = line or parsed.get("line")
+
+        parts = []
+        if page: parts.append(f"pg {page}")
+        if line: parts.append(f"ln {line}")
+        if parts:
+            ui.message(", ".join(parts))
+        else:
+            ui.message("Status not available.")
+
+    script_reportPgLn.__doc__ = "Speak short page+line: 'pg X, ln Y' (Alt+,)."
+
+
+    def script_reportDuxburyColumn(self, gesture):
+        """
+        Speak the current column and total columns in the current line: "Column X of Y".
+        Strategy:
+          1) Try status text for "Col X/Y" or "Column X of Y".
+          2) Else parse current column from status, and compute total from textInfos.
+          3) Else compute both via textInfos.
+          4) Else report unavailability.
+        """
+        # 1) Status text: try "X of Y"
+        text = self._get_status_text_api()
+        if text:
+            colX, totY = self._match_col_and_total(text)
+            if colX and totY:
+                ui.message(f"col {colX} of {totY}")
+                return
+
+            # Parse only the current column
+            curCol = self._match_first_number(text, self._COL_PATTERNS)
+            if not curCol:
+                # fallback positional when API returns combined text
+                nums = re.findall(r"\d+", text)
+                if len(nums) == 3:
+                    curCol = nums[2]
+
+            if curCol:
+                # Compute total columns from current line using textInfos
+                _, totalCols = self._get_line_metrics()
+                if totalCols:
+                    ui.message(f"col {curCol} of {totalCols}")
+                    return
+                else:
+                    # Still speak the current column if total is unknown
+                    ui.message(f"col {curCol}")
+                    return
+
+        # 2) UI-scan if API didn't yield a result
+        cand = self._collect_candidate_texts()
+        big = " | ".join(t for _, t in cand)
+        colX, totY = self._match_col_and_total(big)
+        if colX and totY:
+            ui.message(f"col {colX} of {totY}")
+            return
+
+        parsed = self._parse_from_any(cand)
+        if "col" in parsed:
+            _, totalCols = self._get_line_metrics()
+            if totalCols:
+                ui.message(f"col {parsed['col']} of {totalCols}")
+                return
+            else:
+                ui.message(f"col {parsed['col']}")
+                return
+
+        # 3) Pure textInfos fallback
+        caretCol, totalCols = self._get_line_metrics()
+        if caretCol and totalCols:
+            ui.message(f"col {caretCol} of {totalCols}")
+            return
+        if caretCol:
+            ui.message(f"col {caretCol}")
+            return
+
+        ui.message("col number not available.")
+
+    script_reportDuxburyColumn.__doc__ = "Speak column and total columns (Alt+-)."
+
+    
+    # ---------------------------
+    # Indentation & page-change helpers
+    # ---------------------------
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Track the last page we announced to avoid repetition
+        self._lastAnnouncedPage = None
+        # Settings/flags
+        self._readPageOnTurn = False  # Alt+8 toggles this
+        self._forcePageSpeak = False
+
+    def _get_line_text(self):
+        """Return the full text of the current line (without trailing newlines)."""
+        try:
+            obj = api.getFocusObject()
+            caret = obj.makeTextInfo(textInfos.POSITION_CARET)
+            line = caret.copy()
+            line.expand(textInfos.UNIT_LINE)
+            # Keep spaces/tabs; strip CR/LF
+            t = (line.text or "").replace("\r", "").replace("\n", "")
+            # Normalize non-breaking spaces to normal spaces
+            t = t.replace("\u00A0", " ")
+            return t
+        except Exception as e:
+            log.debug(f"dbtw: _get_line_text failed: {e!r}")
+            return ""
+
+    def _count_leading_spaces(self, lineText):
+        """Count leading blanks (spaces or tabs) until the first non-blank char.
+        Tabs are counted as 1 character cell (as reported by textInfos).
+        """
+        count = 0
+        for ch in lineText:
+            if ch == " " or ch == "\t":
+                count += 1
+            else:
+                break
+        return count
+
+    def script_reportLeadingSpaces(self, gesture):
+        """Speak the number of leading blanks on the current line: '2 spaces'."""
+        t = self._get_line_text()
+        n = self._count_leading_spaces(t)
+        if n == 1:
+            ui.message("1 space")
+        else:
+            ui.message(f"{n} spaces")
+
+    script_reportLeadingSpaces.__doc__ = "Speak number of leading spaces (Alt+7)."
+
+    def _get_current_page(self):
+        """Return current page number as a string, or None if unavailable."""
+        text = self._get_status_text_api()
+        if text:
+            n = self._match_first_number(text, self._PAGE_PATTERNS)
+            if not n:
+                nums = re.findall(r"\d+", text)
+                if nums:
+                    n = nums[0]
+            if n:
+                return n
+
+        # UI-scan fallback
+        cand = self._collect_candidate_texts()
+        parsed = self._parse_from_any(cand)
+        return parsed.get("page")
+
+    def _maybeAnnouncePageChange(self):
+        """Check current page against last announced; if changed, announce 'Page N'."""
+        try:
+            n = self._get_current_page()
+            if n and n != self._lastAnnouncedPage:
+                self._lastAnnouncedPage = n
+                ui.message(f"Page {n}")
+        except Exception as e:
+            log.debug(f"dbtw: _maybeAnnouncePageChange failed: {e!r}")
+
+    # NVDA event handlers: initialize page on focus and announce on caret moves (e.g., DOWN arrow).
+    def event_gainFocus(self, obj, nextHandler):
+        try:
+            nextHandler()
+        finally:
+            # Initialize the last announced page when DBT gains focus
+            self._lastAnnouncedPage = self._get_current_page()
+
+    def event_caret(self, obj, nextHandler):
+        # Let NVDA run its default caret handling first
+        try:
+            nextHandler()
+        finally:
+            
+            # After caret movement completes, decide what to announce.
+            try:
+                if getattr(self, "_forcePageSpeak", False):
+                    n = self._get_current_page()
+                    self._forcePageSpeak = False
+                    if n:
+                        self._lastAnnouncedPage = n
+                        ui.message(f"Page {n}")
+                    else:
+                        ui.message("Page number not available.")
+                else:
+                    if getattr(self, "_readPageOnTurn", True):
+                        self._maybeAnnouncePageChange()
+            except Exception as e:
+                log.debug(f"dbtw: event_caret announce error: {e!r}")
+
+# ---------------------------
+    # Debug helpers
+    # ---------------------------
+    def debugListCandidates(self, gesture):
+        """Speak & log the first found status summary and list up to 30 raw candidates in the log."""
+        cand = self._collect_candidate_texts()
+        parsed = self._parse_from_any(cand)
+        log.debug("dbtw debug: ----- candidate texts begin -----")
+        for i, (_, s) in enumerate(cand[:30], 1):
+            log.debug(f"dbtw cand {i:02d}: {s!r}")
+        log.debug("dbtw debug: ----- candidate texts end -----")
+        if parsed:
+            msg = []
+            if "page" in parsed: msg.append(f"Page {parsed['page']}")
+            if "line" in parsed: msg.append(f"Line {parsed['line']}")
+            if "col"  in parsed: msg.append(f"Column {parsed['col']}")
+            ui.message(", ".join(msg))
+        else:
+            ui.message("No status candidates found.")
+
+    def debugScanSummary(self, gesture):
+        """Force a UI-scan and speak the summary Page/Line/Col if any."""
+        cand = self._collect_candidate_texts()
+        parsed = self._parse_from_any(cand)
+        if parsed:
+            parts = []
+            if "page" in parsed: parts.append(f"Page {parsed['page']}")
+            if "line" in parsed: parts.append(f"Line {parsed['line']}")
+            if "col"  in parsed: parts.append(f"Column {parsed['col']}")
+            ui.message(", ".join(parts))
+        else:
+            ui.message("UI scan did not find status information.")
+
+
+    # ---------------------------
+    # Page announcement controls
+    # ---------------------------
+    def script_toggleReadPageAnnouncements(self, gesture):
+        """Toggle automatic 'Page N' announcements when entering a new page via caret moves."""
+        self._readPageOnTurn = not getattr(self, "_readPageOnTurn", True)
+        ui.message("Read page on" if self._readPageOnTurn else "Read page off")
+
+    script_toggleReadPageAnnouncements.__doc__ = "Toggle auto page announcements (Alt+8)."
+
+    def script_forceAnnouncePageOnNextCaret(self, gesture):
+        """Force announcing current page after this key's caret movement completes.
+        We let the key press go through to the application first.
+        Bound to PageUp/PageDown/Ctrl+Home/Ctrl+End.
+        """
+        try:
+            self._forcePageSpeak = True
+            gesture.send()
+        except Exception:
+            n = self._get_current_page()
+            if n:
+                ui.message(f"Page {n}")
+            else:
+                ui.message("Page number not available.") 
+
+    script_forceAnnouncePageOnNextCaret.__doc__ = "Force page speak on next caret move (PageUp/PageDown/Ctrl+Home/Ctrl+End)."
